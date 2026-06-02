@@ -1,0 +1,8 @@
+name: ai_monitoring_dashboard
+channels:
+  - snowflake
+
+dependencies:
+  - pandas
+  - streamlit
+  - altair
