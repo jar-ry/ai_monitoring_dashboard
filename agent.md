@@ -12,77 +12,76 @@ This guide enables an AI agent (Cortex Code, Claude, etc.) to deploy the Cortex 
 
 ---
 
-## Deployment Steps
+## Step 0: Gather Configuration from User (REQUIRED)
 
-### Step 1: Choose a target database and schema
+**Before doing anything else, ask the user for ALL of the following configuration values.** Do not assume defaults without confirmation.
 
-The user picks where the app + data tables will live. Default: `SAMPLES_DB.PUBLIC`.
+### Questions to ask:
 
-Update `config.py` line 1:
+1. **Database**: Which database should the dashboard tables and app be deployed to?
+   - Default suggestion: `SAMPLES_DB`
+
+2. **Schema**: Which schema within that database?
+   - Default suggestion: `PUBLIC`
+
+3. **Warehouse**: Which warehouse should the app and task use?
+   - Default suggestion: `COMPUTE_WH`
+
+4. **Default Timezone**: What timezone should the dashboard default to for displaying dates?
+   - Options: `America/Los_Angeles`, `America/New_York`, `America/Chicago`, `America/Denver`, `UTC`, `Europe/London`, `Europe/Paris`, `Asia/Tokyo`, `Australia/Sydney`
+   - Default suggestion: `America/Los_Angeles`
+
+5. **Task Schedule Timezone**: What timezone should the scheduled refresh task use?
+   - Default suggestion: Same as dashboard timezone
+
+6. **Task Schedule**: How often should data refresh?
+   - Default suggestion: Every 12 hours (`USING CRON 0 0,12 * * * <TIMEZONE>`)
+
+7. **Streamlit App Name**: What should the deployed Streamlit app be called?
+   - Default suggestion: `CORTEX_TRACKER`
+
+8. **Initial Backfill Days**: How many days of historical data to load?
+   - Default suggestion: `365`
+
+### Store these as variables for the rest of the deployment:
+
+```
+DB_NAME        = <user's answer to #1>
+SCHEMA_NAME    = <user's answer to #2>
+WAREHOUSE_NAME = <user's answer to #3>
+DEFAULT_TZ     = <user's answer to #4>
+TASK_TZ        = <user's answer to #5>
+TASK_SCHEDULE  = <user's answer to #6>
+APP_NAME       = <user's answer to #7>
+BACKFILL_DAYS  = <user's answer to #8>
+```
+
+---
+
+## Step 1: Update configuration files
+
+### 1a. Update `config.py`
+
+Set `SUMMARY_SCHEMA` on line 1:
 ```python
-SUMMARY_SCHEMA = "<DATABASE>.<SCHEMA>"
+SUMMARY_SCHEMA = "<DB_NAME>.<SCHEMA_NAME>"
 ```
 
-### Step 2: Create backend tables
-
-Execute each CREATE TABLE statement from `setup.sql` (or `setup.txt`) against the target schema. There are 6 tables:
-
-1. `AI_USAGE_DAILY_SUMMARY` - aggregated daily metrics by feature/model
-2. `AI_USAGE_USER_SUMMARY` - per-user daily metrics
-3. `AI_USAGE_MODEL_SUMMARY` - per-model daily metrics
-4. `AI_USAGE_REFRESH_LOG` - tracks refresh procedure runs
-5. `AI_USAGE_BUDGETS` - configurable credit budgets
-6. `AI_USAGE_USER_THRESHOLDS` - per-user anomaly thresholds
-
-After creating, insert default rows:
-```sql
-INSERT INTO AI_USAGE_BUDGETS (BUDGET_NAME, BUDGET_PERIOD, FEATURE_NAME, BUDGET_CREDITS, ALERT_THRESHOLD_PCT, CREATED_BY)
-VALUES ('Default Monthly Budget', 'MONTHLY', NULL, 1000, 80, CURRENT_USER());
-
-INSERT INTO AI_USAGE_USER_THRESHOLDS (USER_NAME, FEATURE_NAME, MAX_DAILY_CREDITS, MULTIPLIER_ALERT, CREATED_BY)
-VALUES (NULL, NULL, 100, 3, CURRENT_USER());
+Set `DEFAULT_TIMEZONE` on line 15:
+```python
+DEFAULT_TIMEZONE = "<DEFAULT_TZ>"
 ```
 
-### Step 3: Create the stored procedure
-
-Execute the full `CREATE OR REPLACE PROCEDURE REFRESH_AI_USAGE_SUMMARIES(...)` from `setup.sql`.
-
-**Critical**: If deploying to a schema other than the one set in session context, fully qualify ALL table references in the procedure body (e.g., `DATABASE.SCHEMA.AI_USAGE_DAILY_SUMMARY`). The procedure uses unqualified table names, so either:
-- Set `USE DATABASE` and `USE SCHEMA` before creating it, OR
-- Search-replace table names to be fully qualified
-
-### Step 4: Run initial backfill
+### 1b. Update `setup.sql` / `setup.txt` (lines 34-37)
 
 ```sql
-CALL <DATABASE>.<SCHEMA>.REFRESH_AI_USAGE_SUMMARIES(365);
+SET DB_NAME = '<DB_NAME>';
+SET SCHEMA_NAME = '<SCHEMA_NAME>';
+SET WAREHOUSE_NAME = '<WAREHOUSE_NAME>';
+SET TASK_TIMEZONE = '<TASK_TZ>';
 ```
 
-This takes 30-120 seconds depending on account data volume. Check results:
-
-```sql
-SELECT REFRESH_MODE, STATUS, SOURCE_ERRORS, ROWS_DAILY, ROWS_USER, ROWS_MODEL,
-       DATEDIFF(second, REFRESH_START, REFRESH_END) as DURATION_SEC
-FROM <DATABASE>.<SCHEMA>.AI_USAGE_REFRESH_LOG ORDER BY REFRESH_START DESC LIMIT 1;
-```
-
-**Expected**: STATUS = `SUCCESS` or `PARTIAL` (PARTIAL is OK - it means some preview views like Agents or Intelligence don't exist in this account yet).
-
-### Step 5: Create and resume the scheduled task
-
-```sql
-CREATE OR REPLACE TASK <DATABASE>.<SCHEMA>.REFRESH_AI_USAGE_TASK
-    WAREHOUSE = <WAREHOUSE_NAME>
-    SCHEDULE = 'USING CRON 0 0,12 * * * America/Los_Angeles'
-    COMMENT = 'Twice-daily incremental refresh of AI usage summary tables'
-AS
-    CALL <DATABASE>.<SCHEMA>.REFRESH_AI_USAGE_SUMMARIES(0);
-
-ALTER TASK <DATABASE>.<SCHEMA>.REFRESH_AI_USAGE_TASK RESUME;
-```
-
-### Step 6: Deploy Streamlit app
-
-#### 6a. Create `snowflake.yml`
+### 1c. Update `snowflake.yml`
 
 ```yaml
 definition_version: 2
@@ -90,12 +89,12 @@ entities:
   cortex_tracker:
     type: streamlit
     identifier:
-      name: CORTEX_TRACKER
-      database: <DATABASE>
-      schema: <SCHEMA>
-    query_warehouse: <WAREHOUSE>
+      name: <APP_NAME>
+      database: <DB_NAME>
+      schema: <SCHEMA_NAME>
+    query_warehouse: <WAREHOUSE_NAME>
     runtime_name: SYSTEM$ST_CONTAINER_RUNTIME_PY3_11
-    compute_pool: <COMPUTE_POOL>
+    compute_pool: <COMPUTE_POOL>  # Determined in Step 5
     main_file: streamlit_app.py
     artifacts:
       - streamlit_app.py
@@ -106,14 +105,91 @@ entities:
       - queries_observability.py
 ```
 
-#### 6b. Determine compute_pool
+---
+
+## Step 2: Create backend tables
+
+Execute each CREATE TABLE statement from `setup.sql` against the target schema. There are 6 tables:
+
+1. `AI_USAGE_DAILY_SUMMARY` - aggregated daily metrics by feature/model
+2. `AI_USAGE_USER_SUMMARY` - per-user daily metrics
+3. `AI_USAGE_MODEL_SUMMARY` - per-model daily metrics
+4. `AI_USAGE_REFRESH_LOG` - tracks refresh procedure runs
+5. `AI_USAGE_BUDGETS` - configurable credit budgets
+6. `AI_USAGE_USER_THRESHOLDS` - per-user anomaly thresholds
+
+First set session context:
+```sql
+USE DATABASE <DB_NAME>;
+USE SCHEMA <SCHEMA_NAME>;
+```
+
+Then run all 6 CREATE TABLE statements, followed by default inserts:
+```sql
+INSERT INTO AI_USAGE_BUDGETS (BUDGET_NAME, BUDGET_PERIOD, FEATURE_NAME, BUDGET_CREDITS, ALERT_THRESHOLD_PCT, CREATED_BY)
+VALUES ('Default Monthly Budget', 'MONTHLY', NULL, 1000, 80, CURRENT_USER());
+
+INSERT INTO AI_USAGE_USER_THRESHOLDS (USER_NAME, FEATURE_NAME, MAX_DAILY_CREDITS, MULTIPLIER_ALERT, CREATED_BY)
+VALUES (NULL, NULL, 100, 3, CURRENT_USER());
+```
+
+---
+
+## Step 3: Create the stored procedure
+
+Execute the full `CREATE OR REPLACE PROCEDURE REFRESH_AI_USAGE_SUMMARIES(...)` from `setup.sql`.
+
+**Critical**: The procedure uses unqualified table names (e.g., `AI_USAGE_DAILY_SUMMARY` not `DB.SCHEMA.AI_USAGE_DAILY_SUMMARY`). You MUST either:
+- Set `USE DATABASE <DB_NAME>` and `USE SCHEMA <SCHEMA_NAME>` before creating it (recommended), OR
+- Search-replace all table names in the procedure body to be fully qualified
+
+---
+
+## Step 4: Run initial backfill
+
+```sql
+CALL <DB_NAME>.<SCHEMA_NAME>.REFRESH_AI_USAGE_SUMMARIES(<BACKFILL_DAYS>);
+```
+
+This takes 30-120 seconds depending on account data volume. Check results:
+
+```sql
+SELECT REFRESH_MODE, STATUS, SOURCE_ERRORS, ROWS_DAILY, ROWS_USER, ROWS_MODEL,
+       DATEDIFF(second, REFRESH_START, REFRESH_END) as DURATION_SEC
+FROM <DB_NAME>.<SCHEMA_NAME>.AI_USAGE_REFRESH_LOG ORDER BY REFRESH_START DESC LIMIT 1;
+```
+
+**Expected**: STATUS = `SUCCESS` or `PARTIAL` (PARTIAL is OK - it means some preview views like Agents or Intelligence don't exist in this account yet).
+
+---
+
+## Step 5: Create and resume the scheduled task
+
+```sql
+CREATE OR REPLACE TASK <DB_NAME>.<SCHEMA_NAME>.REFRESH_AI_USAGE_TASK
+    WAREHOUSE = <WAREHOUSE_NAME>
+    SCHEDULE = '<TASK_SCHEDULE>'
+    COMMENT = 'Twice-daily incremental refresh of AI usage summary tables'
+AS
+    CALL <DB_NAME>.<SCHEMA_NAME>.REFRESH_AI_USAGE_SUMMARIES(0);
+
+ALTER TASK <DB_NAME>.<SCHEMA_NAME>.REFRESH_AI_USAGE_TASK RESUME;
+```
+
+The default schedule is: `USING CRON 0 0,12 * * * <TASK_TZ>`
+
+---
+
+## Step 6: Deploy Streamlit app
+
+### 6a. Determine compute_pool
 
 ```sql
 SHOW PARAMETERS LIKE 'DEFAULT_STREAMLIT_COMPUTE_POOL' IN ACCOUNT;
 ```
-Use the `value` column (e.g., `SYSTEM_COMPUTE_POOL_CPU`).
+Use the `value` column (e.g., `SYSTEM_COMPUTE_POOL_CPU`). Set this as `<COMPUTE_POOL>` in `snowflake.yml`.
 
-#### 6c. Deploy
+### 6b. Deploy
 
 ```bash
 snow streamlit deploy cortex_tracker -c <CONNECTION_NAME> --replace
@@ -122,30 +198,32 @@ snow streamlit deploy cortex_tracker -c <CONNECTION_NAME> --replace
 **If this is a fresh deploy on a clean stage**: Just deploy normally.
 
 **If redeploying over an existing app**: The stage may retain stale files (`.streamlit/config.toml`, `pyproject.toml`) from a previous deployment. If a stale `pyproject.toml` exists on stage, the container runtime will try to resolve packages from PyPI, which requires an External Access Integration (EAI). Either:
-- Add an EAI: `ALTER STREAMLIT <DB>.<SCHEMA>.CORTEX_TRACKER SET EXTERNAL_ACCESS_INTEGRATIONS = (ALLOW_ALL_INTEGRATION)` (or whichever EAI exists), OR
-- Drop and recreate: `DROP STREAMLIT <DB>.<SCHEMA>.CORTEX_TRACKER` then deploy fresh (note: the internal stage persists even after DROP - this is a known Snowflake behavior)
+- Add an EAI: `ALTER STREAMLIT <DB_NAME>.<SCHEMA_NAME>.<APP_NAME> SET EXTERNAL_ACCESS_INTEGRATIONS = (ALLOW_ALL_INTEGRATION)` (or whichever EAI exists), OR
+- Drop and recreate: `DROP STREAMLIT <DB_NAME>.<SCHEMA_NAME>.<APP_NAME>` then deploy fresh (note: the internal stage persists even after DROP - this is a known Snowflake behavior)
 
-#### 6d. Verify deployment
+### 6c. Verify deployment
 
 ```sql
-SHOW STREAMLITS LIKE 'CORTEX_TRACKER' IN ACCOUNT;
+SHOW STREAMLITS LIKE '<APP_NAME>' IN ACCOUNT;
 ```
 Expect 1 row. If 0 rows, the deploy silently failed.
 
-### Step 7: Verify end-to-end
+---
+
+## Step 7: Verify end-to-end
 
 ```sql
 -- Row counts
-SELECT 'DAILY' as TBL, COUNT(*) as ROW_COUNT FROM <DB>.<SCHEMA>.AI_USAGE_DAILY_SUMMARY
-UNION ALL SELECT 'USER', COUNT(*) FROM <DB>.<SCHEMA>.AI_USAGE_USER_SUMMARY
-UNION ALL SELECT 'MODEL', COUNT(*) FROM <DB>.<SCHEMA>.AI_USAGE_MODEL_SUMMARY;
+SELECT 'DAILY' as TBL, COUNT(*) as ROW_COUNT FROM <DB_NAME>.<SCHEMA_NAME>.AI_USAGE_DAILY_SUMMARY
+UNION ALL SELECT 'USER', COUNT(*) FROM <DB_NAME>.<SCHEMA_NAME>.AI_USAGE_USER_SUMMARY
+UNION ALL SELECT 'MODEL', COUNT(*) FROM <DB_NAME>.<SCHEMA_NAME>.AI_USAGE_MODEL_SUMMARY;
 
 -- Task is running
-SHOW TASKS LIKE 'REFRESH_AI_USAGE_TASK' IN SCHEMA <DB>.<SCHEMA>;
+SHOW TASKS LIKE 'REFRESH_AI_USAGE_TASK' IN SCHEMA <DB_NAME>.<SCHEMA_NAME>;
 -- state should be 'started'
 
 -- Streamlit exists
-SHOW STREAMLITS LIKE 'CORTEX_TRACKER' IN ACCOUNT;
+SHOW STREAMLITS LIKE '<APP_NAME>' IN ACCOUNT;
 ```
 
 ---
@@ -207,13 +285,15 @@ ACCOUNT_USAGE views have 2-3 hour latency. The task refreshes every 12 hours. En
 
 ## Quick Deploy Checklist
 
-1. [ ] `config.py` has correct `SUMMARY_SCHEMA`
-2. [ ] 6 tables created in target schema
-3. [ ] Default budget + threshold rows inserted
-4. [ ] Stored procedure created
-5. [ ] `CALL REFRESH_AI_USAGE_SUMMARIES(365)` completed (STATUS = SUCCESS or PARTIAL)
-6. [ ] Task created and resumed (state = started)
-7. [ ] `snowflake.yml` created with correct database/schema/warehouse/compute_pool
-8. [ ] `snow streamlit deploy` succeeded
-9. [ ] `SHOW STREAMLITS LIKE 'CORTEX_TRACKER'` returns 1 row
-10. [ ] App loads in browser (not "Example Streamlit App")
+1. [ ] Asked user for: database, schema, warehouse, timezone, task schedule, app name, backfill days
+2. [ ] `config.py` updated with correct `SUMMARY_SCHEMA` and `DEFAULT_TIMEZONE`
+3. [ ] `setup.sql`/`setup.txt` updated with correct DB/schema/warehouse/timezone
+4. [ ] `snowflake.yml` created with correct values + compute_pool from account
+5. [ ] 6 tables created in target schema
+6. [ ] Default budget + threshold rows inserted
+7. [ ] Stored procedure created (with correct session context)
+8. [ ] `CALL REFRESH_AI_USAGE_SUMMARIES(<BACKFILL_DAYS>)` completed (STATUS = SUCCESS or PARTIAL)
+9. [ ] Task created and resumed (state = started)
+10. [ ] `snow streamlit deploy` succeeded
+11. [ ] `SHOW STREAMLITS LIKE '<APP_NAME>'` returns 1 row
+12. [ ] App loads in browser (not "Example Streamlit App")
